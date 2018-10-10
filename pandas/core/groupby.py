@@ -2854,37 +2854,9 @@ class SeriesGroupBy(GroupBy):
 
         return result
 
-    def transform(self, func, *args, **kwargs):
-        """
-        Call function producing a like-indexed Series on each group and return
-        a Series with the transformed values
-
-        Parameters
-        ----------
-        func : function
-            To apply to each group. Should return a Series with the same index
-
-        Examples
-        --------
-        >>> grouped.transform(lambda x: (x - x.mean()) / x.std())
-
-        Returns
-        -------
-        transformed : Series
-        """
-
-        func = self._is_cython_func(func) or func
-
-        # if string function
-        if isinstance(func, compat.string_types):
-            if func in _cython_transforms:
-                # cythonized transform
-                return getattr(self, func)(*args, **kwargs)
-            else:
-                # cythonized aggregation and merge
-                return self._transform_fast(
-                    lambda: getattr(self, func)(*args, **kwargs))
-
+    def _transform_general(self, func, *args, **kwargs):
+        # To transform general
+        # func = self._is_cython_func(func_or_funcs) or func_or_funcs
         # reg transform
         dtype = self._selected_obj.dtype
         result = self._selected_obj.values.copy()
@@ -2907,11 +2879,63 @@ class SeriesGroupBy(GroupBy):
 
             indexer = self._get_index(name)
             result[indexer] = res
+            result = _possibly_downcast_to_dtype(result, dtype)
+        return Series(result, index=self.obj.index, name=self.obj.name)
 
-        result = _possibly_downcast_to_dtype(result, dtype)
-        return self._selected_obj.__class__(result,
-                                            index=self._selected_obj.index,
-                                            name=self._selected_obj.name)
+    def transform(self, func_or_funcs, *args, **kwargs):
+        """
+        Call function or functions producing a like-indexed Series on each
+        group and return
+        a Series with the transformed values
+
+        Parameters
+        ----------
+        func_or_funcs : function or list / dict of functions
+            Function will return a Series with the function applied over the
+            original index.
+            List/dict of functions will produce DataFrame with column names
+            determined by the function names themselves (list) or the keys in
+            the dict with the same index as the original DataFrame.
+
+        Examples
+        --------
+        >>> grouped.transform(lambda x: (x - x.mean()) / x.std())
+
+        Returns
+        -------
+        transformed : Series or DataFrame
+        """
+        _level = kwargs.pop('_level', None)
+        if hasattr(func_or_funcs, '__iter__'):
+            result = self._transform_multiple_funcs(func_or_funcs,
+                                                    (_level or 0) + 1)
+            if not _level and isinstance(result, dict):
+                from pandas import concat
+                result = concat(result, axis=1)
+            result.index = self.obj.index
+            return result
+        # if string function
+        if isinstance(func_or_funcs, compat.string_types):
+            if func_or_funcs in _cython_transforms:
+                # cythonized transform
+                return getattr(self, func_or_funcs)(*args, **kwargs)
+            else:
+                # cythonized aggregation and merge
+                result = getattr(self, func_or_funcs)(*args, **kwargs)
+                # a reduction transform
+                if not isinstance(result, DataFrame):
+                    return self._transform_general(func_or_funcs, *args,
+                                                   **kwargs)
+
+                obj = self._obj_with_exclusions
+                # nuiscance columns
+                if not result.columns.equals(obj.columns):
+                    return self._transform_general(func_or_funcs, *args,
+                                                   **kwargs)
+
+                return self._transform_fast(result, obj)
+        else:
+            return self._transform_general(func_or_funcs, *args, **kwargs)
 
     def _transform_fast(self, func):
         """
@@ -2927,6 +2951,51 @@ class SeriesGroupBy(GroupBy):
         if cast:
             out = self._try_cast(out, self.obj)
         return Series(out, index=self.obj.index, name=self.obj.name)
+
+    def _transform_multiple_funcs(self, arg, _level):
+        if isinstance(arg, dict):
+            columns = list(arg.keys())
+            arg = list(arg.items())
+        elif any(isinstance(x, (tuple, list)) for x in arg):
+            arg = [(x, x) if not isinstance(x, (tuple, list)) else x
+                   for x in arg]
+
+            # indicated column order
+            columns = lzip(*arg)[0]
+        else:
+            # list of functions / function names
+            columns = []
+            for f in arg:
+                if isinstance(f, compat.string_types):
+                    columns.append(f)
+                else:
+                    # protect against callables without names
+                    columns.append(com._get_callable_name(f))
+            arg = lzip(columns, arg)
+
+        results = {}
+        for name, func in arg:
+            obj = self
+            if name in results:
+                raise SpecificationError('Function names must be unique, '
+                                         'found multiple named %s' % name)
+
+            # reset the cache so that we
+            # only include the named selection
+            if name in self._selected_obj:
+                obj = copy.copy(obj)
+                obj._reset_cache()
+                obj._selection = name
+            results[name] = obj.transform(func)
+
+        if isinstance(list(compat.itervalues(results))[0],
+                      DataFrame):
+
+            # let higher level handle
+            if _level:
+                return results
+            return list(compat.itervalues(results))[0]
+        return DataFrame(results, columns=columns)
 
     def filter(self, func, dropna=True, *args, **kwargs):  # noqa
         """
@@ -3630,7 +3699,7 @@ class NDFrameGroupBy(GroupBy):
                               axis=self.axis, verify_integrity=False)
         return self._set_result_index_ordered(concatenated)
 
-    def transform(self, func, *args, **kwargs):
+    def transform(self, func_or_funcs, *args, **kwargs):
         """
         Call function producing a like-indexed DataFrame on each group and
         return a DataFrame having the same indexes as the original object
@@ -3651,29 +3720,38 @@ class NDFrameGroupBy(GroupBy):
         >>> grouped = df.groupby(lambda x: mapping[x])
         >>> grouped.transform(lambda x: (x - x.mean()) / x.std())
         """
-
+        _level = kwargs.pop('_level', None)
+        if hasattr(func_or_funcs, '__iter__'):
+            result = self._transform_multiple_funcs(func_or_funcs,
+                                                    (_level or 0) + 1)
+            if not _level and isinstance(result, dict):
+                from pandas import concat
+                result = concat(result, axis=1)
+            return self._selected_obj.__class__(result,
+                                                index=self._selected_obj.index)
         # optimized transforms
-        func = self._is_cython_func(func) or func
-        if isinstance(func, compat.string_types):
-            if func in _cython_transforms:
+        # func_or_funcs = self._is_cython_func(func_or_funcs) or func_or_funcs
+        if isinstance(func_or_funcs, compat.string_types):
+            if func_or_funcs in _cython_transforms:
                 # cythonized transform
-                return getattr(self, func)(*args, **kwargs)
+                return getattr(self, func_or_funcs)(*args, **kwargs)
             else:
                 # cythonized aggregation and merge
-                result = getattr(self, func)(*args, **kwargs)
+                result = getattr(self, func_or_funcs)(*args, **kwargs)
+                # a reduction transform
+                if not isinstance(result, DataFrame):
+                    return self._transform_general(func_or_funcs, *args,
+                                                   **kwargs)
+
+                obj = self._obj_with_exclusions
+                # nuiscance columns
+                if not result.columns.equals(obj.columns):
+                    return self._transform_general(func_or_funcs, *args,
+                                                   **kwargs)
+
+                return self._transform_fast(result, obj)
         else:
-            return self._transform_general(func, *args, **kwargs)
-
-        # a reduction transform
-        if not isinstance(result, DataFrame):
-            return self._transform_general(func, *args, **kwargs)
-
-        obj = self._obj_with_exclusions
-        # nuiscance columns
-        if not result.columns.equals(obj.columns):
-            return self._transform_general(func, *args, **kwargs)
-
-        return self._transform_fast(result, obj)
+            return self._transform_general(func_or_funcs, *args, **kwargs)
 
     def _transform_fast(self, result, obj):
         """
@@ -3695,6 +3773,51 @@ class NDFrameGroupBy(GroupBy):
 
         return DataFrame._from_arrays(output, columns=result.columns,
                                       index=obj.index)
+
+    def _transform_multiple_funcs(self, arg, _level):
+        if isinstance(arg, dict):
+            columns = list(arg.keys())
+            arg = list(arg.items())
+        elif any(isinstance(x, (tuple, list)) for x in arg):
+            arg = [(x, x) if not isinstance(x, (tuple, list)) else x
+                   for x in arg]
+
+            # indicated column order
+            columns = lzip(*arg)[0]
+        else:
+            # list of functions / function names
+            columns = []
+            for f in arg:
+                if isinstance(f, compat.string_types):
+                    columns.append(f)
+                else:
+                    # protect against callables without names
+                    columns.append(com._get_callable_name(f))
+            arg = lzip(columns, arg)
+
+        results = {}
+        for name, func in arg:
+            obj = self
+            if name in results:
+                raise SpecificationError('Function names must be unique, '
+                                         'found multiple named %s' % name)
+
+            # reset the cache so that we
+            # only include the named selection
+            if name in self._selected_obj:
+                obj = copy.copy(obj)
+                obj._reset_cache()
+                obj._selection = name
+            results[name] = obj.transform(func)
+
+        if isinstance(list(compat.itervalues(results))[0],
+                      DataFrame):
+
+            # let higher level handle
+            if _level:
+                return results
+            return list(compat.itervalues(results))[0]
+        return DataFrame(results, columns=columns)
 
     def _define_paths(self, func, *args, **kwargs):
         if isinstance(func, compat.string_types):
